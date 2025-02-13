@@ -74,6 +74,7 @@ GReWeightNuXSecCCQE::~GReWeightNuXSecCCQE()
   if ( fXSecModel ) delete fXSecModel;
   if ( fXSecModelDef ) delete fXSecModelDef;
   if ( fXSecModelDefNoRPA ) delete fXSecModelDefNoRPA;
+  if ( fXSecModelDefCRPA ) delete fXSecModelDefCRPA;
   if ( fXSecModelDefCoulomb ) delete fXSecModelDefCoulomb;
 
   if ( fXSecIntegrator ) delete fXSecIntegrator;
@@ -96,6 +97,10 @@ bool GReWeightNuXSecCCQE::IsHandled(GSyst_t syst) const
 
      case ( kXSecTwkDial_RPA_CCQE ) :
      case ( kXSecTwkDial_CoulombCCQE ) :
+       handle = true;
+       break;
+
+     case ( kXSecTwkDial_CRPA_CCQE ) :
        handle = true;
        break;
 
@@ -204,6 +209,9 @@ void GReWeightNuXSecCCQE::SetSystematic(GSyst_t syst, double twk_dial)
       case ( kXSecTwkDial_RPA_CCQE ) :
         fRPATwkDial = twk_dial;
         break;
+      case ( kXSecTwkDial_CRPA_CCQE ) :
+        fCRPATwkDial = twk_dial;
+        break;
       case ( kXSecTwkDial_CoulombCCQE ) :
         fCoulombTwkDial = twk_dial;
         break;
@@ -227,6 +235,7 @@ void GReWeightNuXSecCCQE::Reset(void)
   }
 
   fRPATwkDial = 0.;
+  fCRPATwkDial = 0.;
   fCoulombTwkDial = 0.;
 
   this->Reconfigure();
@@ -364,6 +373,8 @@ double GReWeightNuXSecCCQE::CalcWeight(const genie::EventRecord & event)
 
   double wght = this->CalcWeightRPA( event );
 
+  wght *= this->CalcWeightCRPA( event );
+
   wght *= this->CalcWeightCoulomb( event );
 
   if ( fMode==kModeMa && (fModelIsDipole || fModelIsMArunAxial) ) {
@@ -488,6 +499,7 @@ void GReWeightNuXSecCCQE::Init(void)
   }
 
   fRPATwkDial = 0.;
+  fCRPATwkDial = 0.;
   fCoulombTwkDial = 0.;
 
   // Make a copy of the default cross section model that has RPA turned off
@@ -499,6 +511,17 @@ void GReWeightNuXSecCCQE::Init(void)
   rpa_off_reg.Set("RPA", false);
 
   fXSecModelDefNoRPA->Configure( rpa_off_reg );
+
+  // Make a copy of the default cross section model with CRPA turned on
+  Algorithm* alg_def_copy_crpa = algf->AdoptAlgorithm( id );
+  fXSecModelDefCRPA = dynamic_cast<XSecAlgorithmI*>( alg_def_copy_crpa );
+  fXSecModelDefCRPA->AdoptSubstructure();
+
+  Registry crpa_on_reg = fXSecModelDef->GetConfig();
+  crpa_on_reg.Set("RPA", true);
+
+  fXSecModelDefCRPA->Configure( crpa_on_reg );
+
 
   // Make a copy of the default cross section model with a tweaked
   // value of the scaling factor for the Coulomb potential
@@ -727,6 +750,87 @@ double GReWeightNuXSecCCQE::CalcWeightRPA(const genie::EventRecord& event)
 
   return weight;
 }
+
+//_______________________________________________________________________________________
+double GReWeightNuXSecCCQE::CalcWeightCRPA(const genie::EventRecord& event)
+{
+  // use precalculated (neutrino energy, muon costh, muon p) template weights
+  // Enu bins are 0.1 GeV wide, from 0 to 2 GeV
+  int nEnuBins = 20;
+  double EnuBinWidth = 0.1;
+  double ratioCap_hi = 10.;
+
+  bool tweaked = ( std::abs(fCRPATwkDial) > controls::kASmallNum );
+  if ( !tweaked ) return 1.;
+
+  Interaction* interaction = event.Summary();
+
+  interaction->KinePtr()->UseSelectedKinematics();
+
+  double Enu = interaction->InitState().ProbeE(kRfLab);
+  if (Enu >= 2.0) return 1.0; // CRPA applies to Enu < 2 GeV
+
+  double lepton_costh = interaction->Kine().FSLeptonP4().CosTheta();
+  double lepton_p = interaction->Kine().FSLeptonP4().P();
+
+  // find the lower and upper Enu slices that contain the Enu value
+  int Enu_lo_idx = 0;
+  int Enu_hi_idx;
+  for (int i = 0; i < nEnuBins; i++) {
+    if (Enu >= EnuBinWidth*i && Enu < EnuBinWidth*(i+1)) {
+      Enu_lo_idx = i;
+      Enu_hi_idx = i+1;
+      break;
+    }
+  }
+
+  double this_lo = EnuBinWidth*Enu_lo_idx;
+  double this_hi = EnuBinWidth*Enu_hi_idx;
+  double this_cv = (this_lo + this_hi) / 2.;
+  double next_lo;
+  double next_hi;
+  if (Enu > this_cv) {
+    if ((this_hi+EnuBinWidth) > 2.0) return 1.0;  // so technically, we can only use CRPA up to 1.95 GeV    
+    next_lo = this_hi;
+    next_hi = this_hi+EnuBinWidth;
+  }
+  else {
+    if ((this_lo-EnuBinWidth) < 0.0) return 1.0;
+    next_lo = this_lo-EnuBinWidth;
+    next_hi = this_lo;
+  }
+  double next_cv = (next_lo + next_hi) / 2.;
+  LOG("ReW", pDEBUG) << "Enu = " << Enu << ", this Enu_lo = " << this_lo << ", this Enu_hi = " << this_hi;
+  LOG("ReW", pDEBUG) << "Enu = " << Enu << ", next Enu_lo = " << next_lo << ", next Enu_hi = " << next_hi;
+
+  // load weights from file, 2D interpolate in lepton phase space
+  string template_file = "/exp/sbnd/app/users/munjung/generators/forks/crpa/jobs/templates/templates/template.root";
+  TFile *f = new TFile(template_file.c_str(), "READ");
+  TH2D *h_this = (TH2D*)f->Get(Form("h%.2f_%.2f", this_lo, this_hi));
+  TH2D *h_next = (TH2D*)f->Get(Form("h%.2f_%.2f", next_lo, next_hi));
+
+  double weight_this = h_this->Interpolate(lepton_costh, lepton_p);
+  double weight_next = h_next->Interpolate(lepton_costh, lepton_p);
+  f->Close();
+  
+  // 1D interpolate between Enu slices
+  double interp_weight = weight_this + (weight_next - weight_this) * (Enu - this_cv) / (next_cv - this_cv);
+
+  // cap at 1 and 10
+  if ( interp_weight == 0. ) interp_weight = 1.;
+  if ( interp_weight > ratioCap_hi ) interp_weight = ratioCap_hi;
+
+  // tweak dial
+  double weight = fCRPATwkDial*interp_weight + (1. - fCRPATwkDial);
+  LOG("ReW", pDEBUG) << "weight_this = " << weight_this << ", weight_next = " << weight_next << ", weight_interp = " << interp_weight;
+  LOG("ReW", pDEBUG) << "Enu = " << Enu << ", lepton_costh = " << lepton_costh << ", lepton_p = " << lepton_p << ", weight = " << interp_weight;
+  LOG("ReW", pDEBUG) << "fCRPATwkDial = " << fCRPATwkDial << ", weight = " << weight;
+
+  interaction->KinePtr()->ClearRunningValues();
+
+  return weight;
+}
+
 //_______________________________________________________________________________________
 double GReWeightNuXSecCCQE::CalcWeightCoulomb(const genie::EventRecord& event)
 {

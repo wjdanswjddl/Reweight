@@ -206,6 +206,10 @@ typedef enum EGSyst {
   // one with RPA off (only gives non-unit weights for Nieves CCQE)
   kXSecTwkDial_RPA_CCQE,
 
+  // Interpolates between the default CCQE model and the same
+  // one with CRPA on
+  kXSecTwkDial_CRPA_CCQE,
+
   /// Distort photon angular distribution in Delta -> N + photon
   kRDcyTwkDial_Theta_Delta2NRad,
 
